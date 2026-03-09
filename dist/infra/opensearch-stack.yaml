@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenSearch Serverless stack - vector search collection with encryption, network, and data access policies
+
+Parameters:
+  CollectionName:
+    Type: String
+    Default: nl-search-vectors
+    Description: Name of the OpenSearch Serverless vector search collection
+    AllowedPattern: '^[a-z][a-z0-9-]{2,31}$'
+    ConstraintDescription: Must be 3-32 lowercase alphanumeric characters or hyphens, starting with a letter
+  VpcEndpointId:
+    Type: String
+    Description: VPC endpoint ID for OpenSearch Serverless from the network stack
+  Environment:
+    Type: String
+    AllowedValues:
+      - commercial
+      - govcloud
+    Default: commercial
+
+Conditions:
+  IsGovCloud: !Equals [!Ref Environment, govcloud]
+
+Resources:
+  # ---- Encryption Policy ----
+  EncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${CollectionName}-enc'
+      Type: encryption
+      Description: !Sub 'Encryption policy for ${CollectionName} collection'
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${CollectionName}"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # ---- Network Policy ----
+  NetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${CollectionName}-net'
+      Type: network
+      Description: !Sub 'Network policy for ${CollectionName} collection - VPC endpoint access'
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${CollectionName}"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${CollectionName}"]
+              }
+            ],
+            "AllowFromPublic": false,
+            "SourceVPCEs": ["${VpcEndpointId}"]
+          }
+        ]
+
+  # ---- Data Access Policy ----
+  DataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${CollectionName}-access'
+      Type: data
+      Description: !Sub 'Data access policy for ${CollectionName} collection'
+      Policy: !Sub
+        - |
+          [
+            {
+              "Rules": [
+                {
+                  "ResourceType": "index",
+                  "Resource": ["index/${CollectionName}/*"],
+                  "Permission": [
+                    "aoss:CreateIndex",
+                    "aoss:UpdateIndex",
+                    "aoss:DescribeIndex",
+                    "aoss:ReadDocument",
+                    "aoss:WriteDocument"
+                  ]
+                },
+                {
+                  "ResourceType": "collection",
+                  "Resource": ["collection/${CollectionName}"],
+                  "Permission": [
+                    "aoss:CreateCollectionItems",
+                    "aoss:DescribeCollectionItems",
+                    "aoss:UpdateCollectionItems"
+                  ]
+                }
+              ],
+              "Principal": ["${ArnPrefix}:iam::${AWS::AccountId}:root"]
+            }
+          ]
+        - ArnPrefix: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+
+  # ---- Vector Search Collection ----
+  VectorSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - EncryptionPolicy
+      - NetworkPolicy
+    Properties:
+      Name: !Ref CollectionName
+      Type: VECTORSEARCH
+      Description: !Sub 'Vector search collection for NL Search Chatbot (${Environment})'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+Outputs:
+  CollectionArn:
+    Description: OpenSearch Serverless collection ARN
+    Value: !GetAtt VectorSearchCollection.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionArn'
+
+  CollectionEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt VectorSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionEndpoint'
+
+  CollectionName:
+    Description: OpenSearch Serverless collection name
+    Value: !Ref CollectionName
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionName'
