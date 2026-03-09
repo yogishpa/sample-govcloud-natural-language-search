@@ -479,6 +479,3 @@ python -m pytest tests/ -v
 ```
 
 All 225 tests should pass, including 17 Hypothesis property-based tests validating the formal correctness properties defined in the design document.
-# sample-govcloud-natural-language-search
-# sample-govcloud-natural-language-search
-# sample-govcloud-natural-language-search
