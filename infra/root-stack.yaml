@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Root stack - orchestrates nested stacks for NL Search Chatbot (network, opensearch, knowledgebase, ecs)
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - commercial
+      - govcloud
+    Default: commercial
+    Description: Deployment environment (commercial or govcloud)
+  DeploymentRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for deployment
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for TLS termination on ALB (leave empty for HTTP-only demo mode)
+    Default: ''
+  TemplateBaseUrl:
+    Type: String
+    Description: S3 URL where nested CloudFormation templates are stored (e.g. https://s3.amazonaws.com/my-bucket/infra)
+
+Resources:
+  # ---- Network Stack ----
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplateBaseUrl}/network-stack.yaml'
+      Parameters:
+        Environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  # ---- OpenSearch Stack ----
+  OpenSearchStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplateBaseUrl}/opensearch-stack.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        VpcEndpointId: !GetAtt NetworkStack.Outputs.OpenSearchServerlessEndpointId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  # ---- Knowledge Base Stack ----
+  KnowledgeBaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplateBaseUrl}/knowledgebase-stack.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        CollectionArn: !GetAtt OpenSearchStack.Outputs.CollectionArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  # ---- ECS Stack ----
+  ECSStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub '${TemplateBaseUrl}/ecs-stack.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PublicSubnet1Id: !GetAtt NetworkStack.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt NetworkStack.Outputs.PublicSubnet2Id
+        PrivateSubnet1Id: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+        ALBSecurityGroupId: !GetAtt NetworkStack.Outputs.ALBSecurityGroupId
+        ECSTaskSecurityGroupId: !GetAtt NetworkStack.Outputs.ECSTaskSecurityGroupId
+        CertificateArn: !Ref CertificateArn
+        OpenSearchEndpoint: !GetAtt OpenSearchStack.Outputs.CollectionEndpoint
+        BedrockKbId: !GetAtt KnowledgeBaseStack.Outputs.KnowledgeBaseId
+        BedrockRegion: !Ref DeploymentRegion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt NetworkStack.Outputs.VpcId
+
+  CollectionArn:
+    Description: OpenSearch Serverless collection ARN
+    Value: !GetAtt OpenSearchStack.Outputs.CollectionArn
+
+  CollectionEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt OpenSearchStack.Outputs.CollectionEndpoint
+
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID
+    Value: !GetAtt KnowledgeBaseStack.Outputs.KnowledgeBaseId
+
+  DocumentCorpusBucketName:
+    Description: S3 bucket name for document corpus
+    Value: !GetAtt KnowledgeBaseStack.Outputs.DocumentCorpusBucketName
+
+  ClusterName:
+    Description: ECS cluster name
+    Value: !GetAtt ECSStack.Outputs.ClusterName
+
+  ALBDnsName:
+    Description: ALB DNS name for accessing the application
+    Value: !GetAtt ECSStack.Outputs.ALBDnsName
+
+  BackendRepositoryUri:
+    Description: ECR repository URI for backend container images
+    Value: !GetAtt ECSStack.Outputs.BackendRepositoryUri
+
+  FrontendRepositoryUri:
+    Description: ECR repository URI for frontend container images
+    Value: !GetAtt ECSStack.Outputs.FrontendRepositoryUri

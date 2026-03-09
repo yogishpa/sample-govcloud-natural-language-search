@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS Platform stack (stable) - ECS cluster, ALB, target groups, listeners,
+  IAM roles, and CloudWatch log groups. Rarely changes.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [commercial, govcloud]
+    Default: commercial
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  ALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  BedrockKbId:
+    Type: String
+    Description: Bedrock Knowledge Base ID
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+
+Conditions:
+  IsGovCloud: !Equals [!Ref Environment, govcloud]
+
+Resources:
+  # ---- ECS Cluster ----
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'nl-search-${Environment}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---- CloudWatch Log Groups ----
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/nl-search-${Environment}/backend'
+      RetentionInDays: 30
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/nl-search-${Environment}/frontend'
+      RetentionInDays: 30
+
+  # ---- IAM Roles ----
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'nl-search-${Environment}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub
+          - '${P}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+          - P: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'nl-search-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub
+                    - '${P}:bedrock:*::foundation-model/*'
+                    - P: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+                  - !Sub
+                    - '${P}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                    - P: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+              - Effect: Allow
+                Action: bedrock:Retrieve
+                Resource:
+                  - !Sub
+                    - '${P}:bedrock:${BedrockRegion}:${AWS::AccountId}:knowledge-base/${BedrockKbId}'
+                    - P: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource:
+                  - !Sub
+                    - '${P}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+                    - P: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub 'arn:aws:s3:::nl-search-${Environment}-corpus-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::nl-search-${Environment}-corpus-${AWS::AccountId}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !GetAtt BackendLogGroup.Arn
+                  - !Sub '${BackendLogGroup.Arn}:*'
+
+  # ---- Application Load Balancer ----
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnet1Id, !Ref PublicSubnet2Id]
+      SecurityGroups: [!Ref ALBSecurityGroupId]
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-be-tg'
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '3600'
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-fe-tg'
+      Port: 8501
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ['/chat*', '/sessions*', '/health*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+  ClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+  BackendTargetGroupArn:
+    Value: !Ref BackendTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BackendTargetGroupArn'
+  FrontendTargetGroupArn:
+    Value: !Ref FrontendTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendTargetGroupArn'
+  ECSTaskExecutionRoleArn:
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskExecutionRoleArn'
+  ECSTaskRoleArn:
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskRoleArn'
+  BackendLogGroupName:
+    Value: !Ref BackendLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BackendLogGroupName'
+  FrontendLogGroupName:
+    Value: !Ref FrontendLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendLogGroupName'
+  ALBDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDnsName'

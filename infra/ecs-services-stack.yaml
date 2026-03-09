@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS Services stack (deployable) - Task definitions and Fargate services.
+  Deploy this stack to update container images or task configuration.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [commercial, govcloud]
+    Default: commercial
+  PlatformStackName:
+    Type: String
+    Default: nl-search-platform
+    Description: Name of the ECS platform stack for cross-stack references
+  NetworkStackName:
+    Type: String
+    Default: nl-search-network
+    Description: Name of the network stack for subnet/SG references
+  BackendImageUri:
+    Type: String
+    Description: ECR image URI for the backend container
+  FrontendImageUri:
+    Type: String
+    Description: ECR image URI for the frontend container
+  OpenSearchEndpoint:
+    Type: String
+    Description: OpenSearch Serverless collection endpoint URL
+  BedrockKbId:
+    Type: String
+    Description: Bedrock Knowledge Base ID
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+  InferenceProfileArn:
+    Type: String
+    Description: Bedrock inference profile ARN for the LLM
+
+Conditions:
+  IsGovCloud: !Equals [!Ref Environment, govcloud]
+
+Resources:
+  # ---- Backend Task Definition ----
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'nl-search-${Environment}-backend'
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ECSTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ECSTaskRoleArn'
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: OPENSEARCH_ENDPOINT
+              Value: !Ref OpenSearchEndpoint
+            - Name: BEDROCK_KB_ID
+              Value: !Ref BedrockKbId
+            - Name: BEDROCK_REGION
+              Value: !Ref BedrockRegion
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: INFERENCE_PROFILE_ARN
+              Value: !Ref InferenceProfileArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue: !Sub '${PlatformStackName}-BackendLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          HealthCheck:
+            Command: ['CMD-SHELL', 'curl -f http://localhost:8000/health || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # ---- Frontend Task Definition ----
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'nl-search-${Environment}-frontend'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ECSTaskExecutionRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ECSTaskRoleArn'
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: BACKEND_URL
+              Value: !Sub
+                - 'http://${ALBDns}'
+                - ALBDns:
+                    Fn::ImportValue: !Sub '${PlatformStackName}-ALBDnsName'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue: !Sub '${PlatformStackName}-FrontendLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+
+  # ---- Backend Fargate Service ----
+  BackendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub 'nl-search-${Environment}-backend'
+      Cluster:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ClusterArn'
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1Id'
+            - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2Id'
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${NetworkStackName}-ECSTaskSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn:
+            Fn::ImportValue: !Sub '${PlatformStackName}-BackendTargetGroupArn'
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+
+  # ---- Frontend Fargate Service ----
+  FrontendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub 'nl-search-${Environment}-frontend'
+      Cluster:
+        Fn::ImportValue: !Sub '${PlatformStackName}-ClusterArn'
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1Id'
+            - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2Id'
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${NetworkStackName}-ECSTaskSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 8501
+          TargetGroupArn:
+            Fn::ImportValue: !Sub '${PlatformStackName}-FrontendTargetGroupArn'
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+
+Outputs:
+  BackendServiceName:
+    Value: !GetAtt BackendService.Name
+  FrontendServiceName:
+    Value: !GetAtt FrontendService.Name

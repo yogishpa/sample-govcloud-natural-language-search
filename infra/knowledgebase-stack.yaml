@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Knowledge Base stack - Bedrock Knowledge Base with S3 data source and OpenSearch Serverless vector store
+
+Parameters:
+  CollectionArn:
+    Type: String
+    Description: ARN of the OpenSearch Serverless vector search collection from the opensearch stack
+  Environment:
+    Type: String
+    AllowedValues:
+      - commercial
+      - govcloud
+    Default: commercial
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Bedrock embedding model ID for generating document vectors
+
+Conditions:
+  IsGovCloud: !Equals [!Ref Environment, govcloud]
+
+Resources:
+  # ---- S3 Bucket for Document Corpus ----
+  DocumentCorpusBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'nl-search-${Environment}-corpus-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  # ---- IAM Role for Knowledge Base ----
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AmazonBedrockExecutionRoleForKnowledgeBase_${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentCorpusBucket.Arn
+                  - !Sub '${DocumentCorpusBucket.Arn}/*'
+        - PolicyName: BedrockEmbeddingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub
+                  - '${ArnPrefix}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+                  - ArnPrefix: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+        - PolicyName: OpenSearchServerlessAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Ref CollectionArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  # ---- Bedrock Knowledge Base ----
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-kb'
+      Description: !Sub 'Knowledge Base for NL Search Chatbot (${Environment})'
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub
+            - '${ArnPrefix}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+            - ArnPrefix: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Ref CollectionArn
+          VectorIndexName: bedrock-knowledge-base-default-index
+          FieldMapping:
+            VectorField: embedding
+            TextField: text
+            MetadataField: metadata
+      Tags:
+        Environment: !Ref Environment
+        Application: nl-search-chatbot
+
+  # ---- S3 Data Source for Knowledge Base ----
+  S3DataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-s3-source'
+      Description: !Sub 'S3 data source for document corpus (${Environment})'
+      KnowledgeBaseId: !GetAtt BedrockKnowledgeBase.KnowledgeBaseId
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocumentCorpusBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 300
+            OverlapPercentage: 20
+
+  # ---- Scheduled KB Sync (EventBridge + Lambda) ----
+  KBSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'nl-search-${Environment}-kb-sync-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub
+          - '${ArnPrefix}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+          - ArnPrefix: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+      Policies:
+        - PolicyName: BedrockStartIngestion
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                Resource: !Sub
+                  - '${ArnPrefix}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KBId}'
+                  - ArnPrefix: !If [IsGovCloud, 'arn:aws-us-gov', 'arn:aws']
+                    KBId: !GetAtt BedrockKnowledgeBase.KnowledgeBaseId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  KBSyncLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'nl-search-${Environment}-kb-sync'
+      Description: Triggers Bedrock Knowledge Base ingestion sync on a schedule
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt KBSyncLambdaRole.Arn
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !GetAtt BedrockKnowledgeBase.KnowledgeBaseId
+          DATA_SOURCE_ID: !GetAtt S3DataSource.DataSourceId
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          KB_ID = os.environ["KNOWLEDGE_BASE_ID"]
+          DS_ID = os.environ["DATA_SOURCE_ID"]
+          client = boto3.client("bedrock-agent")
+
+          def handler(event, context):
+              response = client.start_ingestion_job(
+                  knowledgeBaseId=KB_ID,
+                  dataSourceId=DS_ID,
+              )
+              job = response["ingestionJob"]
+              print(f"Started ingestion job {job['ingestionJobId']} - status: {job['status']}")
+              return {"ingestionJobId": job["ingestionJobId"], "status": job["status"]}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: nl-search-chatbot
+
+  KBSyncScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'nl-search-${Environment}-kb-sync-hourly'
+      Description: Triggers Bedrock KB sync every hour for NL Search Chatbot
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Id: kb-sync-lambda
+          Arn: !GetAtt KBSyncLambdaFunction.Arn
+
+  KBSyncLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KBSyncLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KBSyncScheduleRule.Arn
+
+Outputs:
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID
+    Value: !GetAtt BedrockKnowledgeBase.KnowledgeBaseId
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseId'
+
+  DocumentCorpusBucketName:
+    Description: S3 bucket name for document corpus
+    Value: !Ref DocumentCorpusBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentCorpusBucketName'
+
+  KnowledgeBaseRoleArn:
+    Description: IAM role ARN for the Knowledge Base
+    Value: !GetAtt KnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseRoleArn'
+
+  DataSourceId:
+    Description: Bedrock Knowledge Base data source ID
+    Value: !GetAtt S3DataSource.DataSourceId
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSourceId'
+
+  KBSyncLambdaArn:
+    Description: Lambda function ARN for KB sync
+    Value: !GetAtt KBSyncLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KBSyncLambdaArn'
